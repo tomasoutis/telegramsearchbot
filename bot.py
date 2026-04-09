@@ -2,9 +2,9 @@ import os
 import json
 import logging
 import threading
+import asyncio
 import time
 from datetime import datetime, timezone
-import telegram, urllib3, six
 
 from flask import Flask, jsonify
 import requests
@@ -12,8 +12,14 @@ import requests
 import firebase_admin
 from firebase_admin import credentials, firestore
 
-from telegram import Update, Bot
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
 # Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -152,7 +158,7 @@ def search_google(keyword):
         logger.exception("Google search failed: %s", e)
         return []
 
-def process_search_cycle(bot: Bot):
+async def process_search_cycle(bot):
     if db is None:
         logger.warning("Firestore not initialized; skipping search cycle")
         return
@@ -189,7 +195,7 @@ def process_search_cycle(bot: Bot):
         try:
             msg = f"🔍 Keyword: {keyword}\n\n{r.get('title')}\n{link}\n\n{r.get('snippet') or ''}"
             if TELEGRAM_ADMIN_USER_ID:
-                bot.send_message(chat_id=TELEGRAM_ADMIN_USER_ID, text=msg)
+                await bot.send_message(chat_id=TELEGRAM_ADMIN_USER_ID, text=msg)
                 logger.info("Sent result to admin: %s", link)
         except Exception:
             logger.exception("Failed to send telegram message for link: %s", link)
@@ -197,85 +203,93 @@ def process_search_cycle(bot: Bot):
     increment_daily_count(doc_ref, data)
     advance_index(doc_ref, data)
 
-def scheduler_loop(bot: Bot):
-    logger.info("Scheduler thread started")
+async def scheduler_loop(app):
+    logger.info("Async scheduler started")
     while True:
         try:
-            process_search_cycle(bot)
+            await process_search_cycle(app.bot)
         except Exception:
             logger.exception("Error during scheduled search cycle")
-        time.sleep(60)
+        await asyncio.sleep(60)
 
 # --- Telegram handlers ---
 awaiting_upload = set()
 
 def restricted_admin(func):
-    def wrapper(update: Update, context: CallbackContext):
-        user_id = update.effective_user.id
-        if TELEGRAM_ADMIN_USER_ID and user_id != TELEGRAM_ADMIN_USER_ID:
-            update.message.reply_text("Unauthorized")
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user = update.effective_user
+        if TELEGRAM_ADMIN_USER_ID and user and user.id != TELEGRAM_ADMIN_USER_ID:
+            await update.message.reply_text("Unauthorized")
             return
-        return func(update, context)
+        return await func(update, context)
     return wrapper
 
-def start(update: Update, context: CallbackContext):
-    update.message.reply_text("Telegram Search Bot running.")
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Telegram Search Bot running.")
+
 
 @restricted_admin
-def status(update: Update, context: CallbackContext):
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if db is None:
-        update.message.reply_text("Firestore not configured")
+        await update.message.reply_text("Firestore not configured")
         return
     doc_ref, data = get_keywords_doc()
     total = len(data.get("list") or [])
     idx = data.get("current_index") or 0
     searches = data.get("daily_count") or 0
     msg = f"Total keywords: {total}\nCurrent index: {idx}\nSearches today: {searches}"
-    update.message.reply_text(msg)
+    await update.message.reply_text(msg)
+
 
 @restricted_admin
-def reset_index(update: Update, context: CallbackContext):
+async def reset_index(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if db is None:
-        update.message.reply_text("Firestore not configured")
+        await update.message.reply_text("Firestore not configured")
         return
     doc_ref, data = get_keywords_doc()
     doc_ref.update({"current_index": 0})
-    update.message.reply_text("Keyword index reset to 0")
+    await update.message.reply_text("Keyword index reset to 0")
+
 
 @restricted_admin
-def add_keyword(update: Update, context: CallbackContext):
-    text = update.message.text
+async def add_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text or ""
     parts = text.split(" ", 1)
     if len(parts) < 2:
-        update.message.reply_text("Usage: /add <keyword text>")
+        await update.message.reply_text("Usage: /add <keyword text>")
         return
     kw = parts[1].strip()
     doc_ref, data = get_keywords_doc()
     kws = data.get("list") or []
     if kw in kws:
-        update.message.reply_text("Keyword already exists")
+        await update.message.reply_text("Keyword already exists")
         return
     kws.append(kw)
     doc_ref.update({"list": kws})
-    update.message.reply_text(f"Added keyword: {kw}")
+    await update.message.reply_text(f"Added keyword: {kw}")
+
 
 @restricted_admin
-def upload_start(update: Update, context: CallbackContext):
-    update.message.reply_text("Please send a JSON file containing an array of keywords (e.g. [\"kw1\", \"kw2\"]).")
+async def upload_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Please send a JSON file containing an array of keywords (e.g. [\"kw1\", \"kw2\"])."
+    )
     awaiting_upload.add(update.effective_chat.id)
 
-def handle_document(update: Update, context: CallbackContext):
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if chat_id not in awaiting_upload:
         return
     if TELEGRAM_ADMIN_USER_ID and update.effective_user.id != TELEGRAM_ADMIN_USER_ID:
-        update.message.reply_text("Unauthorized")
+        await update.message.reply_text("Unauthorized")
         return
     doc = update.message.document
-    f = context.bot.get_file(doc.file_id)
-    data_bytes = f.download_as_bytearray()
+    file = await doc.get_file()
+    data_bytes = await file.download_as_bytearray()
     try:
-        arr = json.loads(data_bytes.decode('utf-8'))
+        arr = json.loads(data_bytes.decode("utf-8"))
         if not isinstance(arr, list):
             raise ValueError("JSON is not an array")
         # sanitize
@@ -287,7 +301,7 @@ def handle_document(update: Update, context: CallbackContext):
             if s:
                 cleaned.append(s)
         if not cleaned:
-            update.message.reply_text("No valid keywords found in file")
+            await update.message.reply_text("No valid keywords found in file")
             awaiting_upload.discard(chat_id)
             return
         # merge with existing
@@ -302,41 +316,47 @@ def handle_document(update: Update, context: CallbackContext):
                 seen.add(k)
                 deduped.append(k)
         doc_ref.update({"list": deduped})
-        update.message.reply_text(f"Uploaded {len(cleaned)} keywords. Total now: {len(deduped)}")
+        await update.message.reply_text(f"Uploaded {len(cleaned)} keywords. Total now: {len(deduped)}")
     except Exception as e:
         logger.exception("Failed to process uploaded file")
-        update.message.reply_text(f"Failed to process file: {e}")
+        await update.message.reply_text(f"Failed to process file: {e}")
     finally:
         awaiting_upload.discard(chat_id)
 
-def main():
-    global db
-    db = init_firestore()
-    updater = Updater(TELEGRAM_BOT_TOKEN, use_context=True)
-    dp = updater.dispatcher
-    dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(CommandHandler("status", status))
-    dp.add_handler(CommandHandler("reset", reset_index))
-    dp.add_handler(CommandHandler("add", add_keyword))
-    dp.add_handler(CommandHandler("upload", upload_start))
-    dp.add_handler(MessageHandler(Filters.document, handle_document))
-
-    updater.start_polling()
-    logger.info("Telegram polling started")
-
-    # Start scheduler thread
-    bot = updater.bot
-    t = threading.Thread(target=scheduler_loop, args=(bot,), daemon=True)
-    t.start()
-
-    # Start Flask app for Render health-check
+def start_flask():
     port = int(os.environ.get("PORT", 8080))
+
     @app.route("/", methods=["GET"])
     def health():
         return jsonify({"status": "ok"})
 
     logger.info("Starting Flask webserver on port %s", port)
     app.run(host="0.0.0.0", port=port)
+
+
+def main():
+    global db
+    db = init_firestore()
+
+    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("reset", reset_index))
+    application.add_handler(CommandHandler("add", add_keyword))
+    application.add_handler(CommandHandler("upload", upload_start))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+
+    # Start Flask in a separate thread so PTB can run the asyncio loop
+    t = threading.Thread(target=start_flask, daemon=True)
+    t.start()
+
+    # Start scheduler as a background task inside the application
+    application.create_task(scheduler_loop(application))
+
+    logger.info("Starting Telegram Application (long polling)")
+    application.run_polling()
+
 
 if __name__ == '__main__':
     main()
