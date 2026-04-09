@@ -1,0 +1,341 @@
+import os
+import json
+import logging
+import threading
+import time
+from datetime import datetime, timezone
+
+from flask import Flask, jsonify
+import requests
+
+import firebase_admin
+from firebase_admin import credentials, firestore
+
+from telegram import Update, Bot
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
+
+# Logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
+# Environment
+CUSTOM_GOOGLE_SEARCH_API = os.environ.get("CUSTOM_GOOGLE_SEARCH_API")
+SEARCH_ENGINE_ID = os.environ.get("SEARCH_ENGINE_ID")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_ADMIN_USER_ID = int(os.environ.get("TELEGRAM_ADMIN_USER_ID")) if os.environ.get("TELEGRAM_ADMIN_USER_ID") else None
+FIREBASE_KEY = os.environ.get("FIREBASE_KEY")
+
+if not TELEGRAM_BOT_TOKEN:
+    logger.error("TELEGRAM_BOT_TOKEN not set in environment")
+    raise SystemExit("Missing TELEGRAM_BOT_TOKEN")
+
+app = Flask(__name__)
+
+db = None
+
+def init_firestore():
+    global db
+    if db is not None:
+        return db
+    if not FIREBASE_KEY:
+        logger.error("FIREBASE_KEY not set; continuing without Firestore")
+        return None
+    # FIREBASE_KEY may be JSON string with escaped newlines; try to parse robustly
+    key_str = FIREBASE_KEY
+    if key_str.startswith("'") and key_str.endswith("'"):
+        key_str = key_str[1:-1]
+    try:
+        key_json = json.loads(key_str)
+    except Exception:
+        # attempt literal eval fallback
+        import ast
+        key_json = ast.literal_eval(key_str)
+    # Replace escaped newlines in private_key
+    if "private_key" in key_json:
+        key_json["private_key"] = key_json["private_key"].replace('\\n', '\n')
+
+    cred = credentials.Certificate(key_json)
+    try:
+        firebase_admin.initialize_app(cred)
+    except ValueError:
+        # already initialized
+        pass
+    db = firestore.client()
+    logger.info("Initialized Firestore")
+    ensure_keywords_doc()
+    return db
+
+def ensure_keywords_doc():
+    d = db.collection("main").document("keywords")
+    doc = d.get()
+    today = datetime.now(timezone.utc).date().isoformat()
+    if not doc.exists:
+        d.set({
+            "list": [],
+            "current_index": 0,
+            "last_reset_date": today,
+            "daily_count": 0,
+        })
+        logger.info("Created keywords document")
+
+def get_keywords_doc():
+    d = db.collection("main").document("keywords")
+    doc = d.get()
+    if not doc.exists:
+        ensure_keywords_doc()
+        doc = d.get()
+    return d, doc.to_dict()
+
+def reset_daily_if_needed(doc_ref, data):
+    today = datetime.now(timezone.utc).date().isoformat()
+    if data.get("last_reset_date") != today:
+        doc_ref.update({
+            "last_reset_date": today,
+            "daily_count": 0,
+        })
+        data["last_reset_date"] = today
+        data["daily_count"] = 0
+        logger.info("Daily counters reset for new day")
+
+def increment_daily_count(doc_ref, data):
+    new_count = (data.get("daily_count") or 0) + 1
+    doc_ref.update({"daily_count": new_count})
+    data["daily_count"] = new_count
+
+def advance_index(doc_ref, data):
+    keywords = data.get("list") or []
+    if not keywords:
+        return
+    next_index = (data.get("current_index") or 0) + 1
+    if next_index >= len(keywords):
+        next_index = 0
+    doc_ref.update({"current_index": next_index})
+    data["current_index"] = next_index
+
+def get_current_keyword(doc_ref, data):
+    keywords = data.get("list") or []
+    if not keywords:
+        return None
+    idx = data.get("current_index") or 0
+    if idx >= len(keywords):
+        idx = 0
+        doc_ref.update({"current_index": 0})
+        data["current_index"] = 0
+    return keywords[idx]
+
+def search_google(keyword):
+    if not CUSTOM_GOOGLE_SEARCH_API or not SEARCH_ENGINE_ID:
+        logger.error("Search API key or search engine id missing")
+        return []
+    q = f"site:t.me {keyword}"
+    params = {
+        "key": CUSTOM_GOOGLE_SEARCH_API,
+        "cx": SEARCH_ENGINE_ID,
+        "q": q,
+    }
+    try:
+        resp = requests.get("https://www.googleapis.com/customsearch/v1", params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        items = data.get("items", [])
+        results = []
+        for it in items:
+            results.append({
+                "title": it.get("title"),
+                "link": it.get("link"),
+                "snippet": it.get("snippet"),
+            })
+        logger.info(f"Search for '{keyword}' returned {len(results)} items")
+        return results
+    except Exception as e:
+        logger.exception("Google search failed: %s", e)
+        return []
+
+def process_search_cycle(bot: Bot):
+    if db is None:
+        logger.warning("Firestore not initialized; skipping search cycle")
+        return
+    doc_ref, data = get_keywords_doc()
+    reset_daily_if_needed(doc_ref, data)
+    if (data.get("daily_count") or 0) >= 90:
+        logger.info("Daily search limit reached (%s). Skipping until next day.", data.get("daily_count"))
+        return
+    keyword = get_current_keyword(doc_ref, data)
+    if not keyword:
+        logger.info("No keywords configured")
+        return
+    logger.info("Performing search for keyword: %s", keyword)
+    results = search_google(keyword)
+    for r in results:
+        link = r.get("link")
+        sent_q = db.collection("sent_links").where("link", "==", link).limit(1).get()
+        if sent_q and len(sent_q) > 0:
+            logger.debug("Link already sent: %s", link)
+            continue
+        # Save to results
+        db.collection("results").add({
+            "keyword": keyword,
+            "title": r.get("title"),
+            "link": link,
+            "snippet": r.get("snippet"),
+            "created_at": firestore.SERVER_TIMESTAMP,
+        })
+        db.collection("sent_links").add({
+            "link": link,
+            "created_at": firestore.SERVER_TIMESTAMP,
+        })
+        # Send to admin
+        try:
+            msg = f"🔍 Keyword: {keyword}\n\n{r.get('title')}\n{link}\n\n{r.get('snippet') or ''}"
+            if TELEGRAM_ADMIN_USER_ID:
+                bot.send_message(chat_id=TELEGRAM_ADMIN_USER_ID, text=msg)
+                logger.info("Sent result to admin: %s", link)
+        except Exception:
+            logger.exception("Failed to send telegram message for link: %s", link)
+    # update counts and advance index
+    increment_daily_count(doc_ref, data)
+    advance_index(doc_ref, data)
+
+def scheduler_loop(bot: Bot):
+    logger.info("Scheduler thread started")
+    while True:
+        try:
+            process_search_cycle(bot)
+        except Exception:
+            logger.exception("Error during scheduled search cycle")
+        time.sleep(60)
+
+# --- Telegram handlers ---
+awaiting_upload = set()
+
+def restricted_admin(func):
+    def wrapper(update: Update, context: CallbackContext):
+        user_id = update.effective_user.id
+        if TELEGRAM_ADMIN_USER_ID and user_id != TELEGRAM_ADMIN_USER_ID:
+            update.message.reply_text("Unauthorized")
+            return
+        return func(update, context)
+    return wrapper
+
+def start(update: Update, context: CallbackContext):
+    update.message.reply_text("Telegram Search Bot running.")
+
+@restricted_admin
+def status(update: Update, context: CallbackContext):
+    if db is None:
+        update.message.reply_text("Firestore not configured")
+        return
+    doc_ref, data = get_keywords_doc()
+    total = len(data.get("list") or [])
+    idx = data.get("current_index") or 0
+    searches = data.get("daily_count") or 0
+    msg = f"Total keywords: {total}\nCurrent index: {idx}\nSearches today: {searches}"
+    update.message.reply_text(msg)
+
+@restricted_admin
+def reset_index(update: Update, context: CallbackContext):
+    if db is None:
+        update.message.reply_text("Firestore not configured")
+        return
+    doc_ref, data = get_keywords_doc()
+    doc_ref.update({"current_index": 0})
+    update.message.reply_text("Keyword index reset to 0")
+
+@restricted_admin
+def add_keyword(update: Update, context: CallbackContext):
+    text = update.message.text
+    parts = text.split(" ", 1)
+    if len(parts) < 2:
+        update.message.reply_text("Usage: /add <keyword text>")
+        return
+    kw = parts[1].strip()
+    doc_ref, data = get_keywords_doc()
+    kws = data.get("list") or []
+    if kw in kws:
+        update.message.reply_text("Keyword already exists")
+        return
+    kws.append(kw)
+    doc_ref.update({"list": kws})
+    update.message.reply_text(f"Added keyword: {kw}")
+
+@restricted_admin
+def upload_start(update: Update, context: CallbackContext):
+    update.message.reply_text("Please send a JSON file containing an array of keywords (e.g. [\"kw1\", \"kw2\"]).")
+    awaiting_upload.add(update.effective_chat.id)
+
+def handle_document(update: Update, context: CallbackContext):
+    chat_id = update.effective_chat.id
+    if chat_id not in awaiting_upload:
+        return
+    if TELEGRAM_ADMIN_USER_ID and update.effective_user.id != TELEGRAM_ADMIN_USER_ID:
+        update.message.reply_text("Unauthorized")
+        return
+    doc = update.message.document
+    f = context.bot.get_file(doc.file_id)
+    data_bytes = f.download_as_bytearray()
+    try:
+        arr = json.loads(data_bytes.decode('utf-8'))
+        if not isinstance(arr, list):
+            raise ValueError("JSON is not an array")
+        # sanitize
+        cleaned = []
+        for it in arr:
+            if not isinstance(it, str):
+                continue
+            s = it.strip()
+            if s:
+                cleaned.append(s)
+        if not cleaned:
+            update.message.reply_text("No valid keywords found in file")
+            awaiting_upload.discard(chat_id)
+            return
+        # merge with existing
+        doc_ref, data = get_keywords_doc()
+        existing = data.get("list") or []
+        merged = existing + cleaned
+        # dedupe while preserving order
+        seen = set()
+        deduped = []
+        for k in merged:
+            if k not in seen:
+                seen.add(k)
+                deduped.append(k)
+        doc_ref.update({"list": deduped})
+        update.message.reply_text(f"Uploaded {len(cleaned)} keywords. Total now: {len(deduped)}")
+    except Exception as e:
+        logger.exception("Failed to process uploaded file")
+        update.message.reply_text(f"Failed to process file: {e}")
+    finally:
+        awaiting_upload.discard(chat_id)
+
+def main():
+    global db
+    db = init_firestore()
+    updater = Updater(TELEGRAM_BOT_TOKEN, use_context=True)
+    dp = updater.dispatcher
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("status", status))
+    dp.add_handler(CommandHandler("reset", reset_index))
+    dp.add_handler(CommandHandler("add", add_keyword))
+    dp.add_handler(CommandHandler("upload", upload_start))
+    dp.add_handler(MessageHandler(Filters.document, handle_document))
+
+    updater.start_polling()
+    logger.info("Telegram polling started")
+
+    # Start scheduler thread
+    bot = updater.bot
+    t = threading.Thread(target=scheduler_loop, args=(bot,), daemon=True)
+    t.start()
+
+    # Start Flask app for Render health-check
+    port = int(os.environ.get("PORT", 8080))
+    @app.route("/", methods=["GET"])
+    def health():
+        return jsonify({"status": "ok"})
+
+    logger.info("Starting Flask webserver on port %s", port)
+    app.run(host="0.0.0.0", port=port)
+
+if __name__ == '__main__':
+    main()
