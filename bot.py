@@ -133,7 +133,7 @@ def get_current_keyword(doc_ref, data):
 def search_google(keyword):
     if not CUSTOM_GOOGLE_SEARCH_API or not SEARCH_ENGINE_ID:
         logger.error("Search API key or search engine id missing")
-        return []
+        return [], "Search API key or search engine id missing"
     q = f"site:t.me {keyword}"
     params = {
         "key": CUSTOM_GOOGLE_SEARCH_API,
@@ -153,10 +153,20 @@ def search_google(keyword):
                 "snippet": it.get("snippet"),
             })
         logger.info(f"Search for '{keyword}' returned {len(results)} items")
-        return results
+        return results, None
+    except requests.exceptions.HTTPError as e:
+        # Try to include response body for debugging 400 errors
+        resp_text = None
+        try:
+            resp_text = e.response.text if e.response is not None else None
+        except Exception:
+            resp_text = None
+        err_msg = f"HTTPError: {e}" + (f" - {resp_text}" if resp_text else "")
+        logger.exception("Google search failed: %s", err_msg)
+        return [], err_msg
     except Exception as e:
         logger.exception("Google search failed: %s", e)
-        return []
+        return [], str(e)
 
 async def process_search_cycle(bot):
     if db is None:
@@ -172,7 +182,28 @@ async def process_search_cycle(bot):
         logger.info("No keywords configured")
         return
     logger.info("Performing search for keyword: %s", keyword)
-    results = search_google(keyword)
+    results, err = search_google(keyword)
+
+    # Send a brief summary to the admin for each completed search (success or error)
+    try:
+        if TELEGRAM_ADMIN_USER_ID:
+            if err:
+                summary = f"⚠️ Search for '{keyword}' failed:\n{err}"
+            else:
+                if results:
+                    summary = f"🔎 Search complete for '{keyword}' — {len(results)} result(s) found. Sending unique links now."
+                else:
+                    summary = f"🔎 Search complete for '{keyword}' — no results found."
+            await bot.send_message(chat_id=TELEGRAM_ADMIN_USER_ID, text=summary)
+    except Exception:
+        logger.exception("Failed to send search summary to admin for keyword: %s", keyword)
+
+    if err:
+        # don't attempt to process individual results when there was an error
+        increment_daily_count(doc_ref, data)
+        advance_index(doc_ref, data)
+        return
+
     for r in results:
         link = r.get("link")
         sent_q = db.collection("sent_links").where("link", "==", link).limit(1).get()
