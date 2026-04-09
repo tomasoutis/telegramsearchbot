@@ -4,6 +4,7 @@ import logging
 import threading
 import time
 from datetime import datetime, timezone
+import telegram, urllib3, six
 
 from flask import Flask, jsonify
 import requests
