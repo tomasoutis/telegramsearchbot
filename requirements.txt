@@ -2,3 +2,5 @@ python-telegram-bot==13.15
 firebase-admin>=6.0.0
 Flask>=2.0
 requests>=2.25
+urllib3>=1.26
+six>=1.15
