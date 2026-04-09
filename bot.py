@@ -203,11 +203,11 @@ async def process_search_cycle(bot):
     increment_daily_count(doc_ref, data)
     advance_index(doc_ref, data)
 
-async def scheduler_loop(app):
+async def scheduler_loop(bot):
     logger.info("Async scheduler started")
     while True:
         try:
-            await process_search_cycle(app.bot)
+            await process_search_cycle(bot)
         except Exception:
             logger.exception("Error during scheduled search cycle")
         await asyncio.sleep(60)
@@ -340,6 +340,12 @@ def main():
 
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
+    async def post_init(app):
+        logger.info("Application initialized, starting scheduler")
+        app.create_task(scheduler_loop(app.bot))
+
+    application.post_init = post_init
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("reset", reset_index))
@@ -350,9 +356,6 @@ def main():
     # Start Flask in a separate thread so PTB can run the asyncio loop
     t = threading.Thread(target=start_flask, daemon=True)
     t.start()
-
-    # Start scheduler as a background task inside the application
-    application.create_task(scheduler_loop(application))
 
     logger.info("Starting Telegram Application (long polling)")
     application.run_polling()
