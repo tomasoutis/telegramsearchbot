@@ -3,3 +3,4 @@ firebase-admin>=6.0.0
 Flask>=2.0
 requests>=2.25
 six>=1.15
+duckduckgo_search>=2.7.0
