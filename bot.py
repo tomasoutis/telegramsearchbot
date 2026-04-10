@@ -136,16 +136,15 @@ def search_google(keyword):
     q = f"site:t.me {keyword}"
 
     try:
-        from duckduckgo_search import DDGS
+        from ddgs import DDGS
     except ImportError:
-        err = "duckduckgo_search package not available"
+        err = "ddgs package not available"
         logger.error(err)
         return [], err
 
     try:
         results = []
         with DDGS() as ddgs:
-            # The modern syntax uses ddgs.text() 
             items = ddgs.text(q, max_results=10)
             
             if items:
@@ -155,12 +154,11 @@ def search_google(keyword):
                         "link": it.get("href", ""),
                         "snippet": it.get("body", ""),
                     })
-        logger.info(f"Search for '{keyword}' returned {len(results)} items (DuckDuckGo)")
+        logger.info(f"Search for '{keyword}' returned {len(results)} items (DuckDuckGo/DDGS)")
         return results, None
     except Exception as e:
         logger.exception("Search failed: %s", e)
         return [], str(e)
-
 async def process_search_cycle(bot):
     if db is None:
         logger.warning("Firestore not initialized; skipping search cycle")
