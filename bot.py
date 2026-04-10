@@ -145,7 +145,7 @@ def search_google(keyword):
     try:
         results = []
         with DDGS() as ddgs:
-            items = ddgs.text(q, max_results=10)
+            items = ddgs.text(q, max_results=50)
             
             if items:
                 for it in items:
@@ -232,7 +232,7 @@ async def scheduler_loop(bot):
             await process_search_cycle(bot)
         except Exception:
             logger.exception("Error during scheduled search cycle")
-        await asyncio.sleep(60)
+        await asyncio.sleep(300)
 
 # --- Telegram handlers ---
 awaiting_upload = set()
