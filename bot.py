@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 
 from flask import Flask, jsonify
 import requests
+from duckduckgo_search import ddg
 
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -131,41 +132,23 @@ def get_current_keyword(doc_ref, data):
     return keywords[idx]
 
 def search_google(keyword):
-    if not CUSTOM_GOOGLE_SEARCH_API or not SEARCH_ENGINE_ID:
-        logger.error("Search API key or search engine id missing")
-        return [], "Search API key or search engine id missing"
+    # Use duckduckgo_search.ddg to perform the site-scoped query and return
+    # results in the same structure expected by the rest of the pipeline.
     q = f"site:t.me {keyword}"
-    params = {
-        "key": CUSTOM_GOOGLE_SEARCH_API,
-        "cx": SEARCH_ENGINE_ID,
-        "q": q,
-    }
     try:
-        resp = requests.get("https://www.googleapis.com/customsearch/v1", params=params, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-        items = data.get("items", [])
+        items = ddg(q, max_results=10)
         results = []
-        for it in items:
-            results.append({
-                "title": it.get("title"),
-                "link": it.get("link"),
-                "snippet": it.get("snippet"),
-            })
-        logger.info(f"Search for '{keyword}' returned {len(results)} items")
+        if items:
+            for it in items:
+                results.append({
+                    "title": it.get("title"),
+                    "link": it.get("href") or it.get("link"),
+                    "snippet": it.get("body") or it.get("snippet") or "",
+                })
+        logger.info(f"Search for '{keyword}' returned {len(results)} items (DuckDuckGo)")
         return results, None
-    except requests.exceptions.HTTPError as e:
-        # Try to include response body for debugging 400 errors
-        resp_text = None
-        try:
-            resp_text = e.response.text if e.response is not None else None
-        except Exception:
-            resp_text = None
-        err_msg = f"HTTPError: {e}" + (f" - {resp_text}" if resp_text else "")
-        logger.exception("Google search failed: %s", err_msg)
-        return [], err_msg
     except Exception as e:
-        logger.exception("Google search failed: %s", e)
+        logger.exception("Search failed: %s", e)
         return [], str(e)
 
 async def process_search_cycle(bot):
