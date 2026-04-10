@@ -8,7 +8,8 @@ from datetime import datetime, timezone
 
 from flask import Flask, jsonify
 import requests
-from duckduckgo_search import ddg
+# Import duckduckgo_search dynamically inside `search_google` to support
+# environments where the package export layout differs between versions.
 
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -135,8 +136,28 @@ def search_google(keyword):
     # Use duckduckgo_search.ddg to perform the site-scoped query and return
     # results in the same structure expected by the rest of the pipeline.
     q = f"site:t.me {keyword}"
+
+    # Try to import the ddg function in multiple ways to be compatible
+    # with different duckduckgo_search package versions.
+    ddg_func = None
     try:
-        items = ddg(q, max_results=10)
+        from duckduckgo_search import ddg as _ddg  # preferred
+        ddg_func = _ddg
+    except Exception:
+        try:
+            import duckduckgo_search as _ddgs
+            # common alternative attributes
+            ddg_func = getattr(_ddgs, "ddg", None) or getattr(_ddgs, "search", None)
+        except Exception:
+            ddg_func = None
+
+    if not callable(ddg_func):
+        err = "duckduckgo_search.ddg not available in environment"
+        logger.error(err)
+        return [], err
+
+    try:
+        items = ddg_func(q, max_results=10)
         results = []
         if items:
             for it in items:
